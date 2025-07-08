@@ -1,0 +1,129 @@
+# filename: get_papers_tool.py
+import requests
+import csv
+import sys
+import typer
+from typing import List, Dict, Optional
+from lxml import etree
+
+app = typer.Typer()
+
+# ---------- PubMed API Constants ----------
+BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+# ---------- Utility Functions ----------
+
+def search_pubmed(query: str) -> List[str]:
+    """Search PubMed using ESearch."""
+    response = requests.get(f"{BASE_URL}/esearch.fcgi", params={
+        "db": "pubmed",
+        "term": query,
+        "retmode": "json",
+        "retmax": 100
+    })
+    response.raise_for_status()
+    return response.json().get("esearchresult", {}).get("idlist", [])
+
+def fetch_details(pubmed_ids: List[str]) -> List[Dict]:
+    """Fetch paper details using EFetch."""
+    ids_str = ",".join(pubmed_ids)
+    response = requests.get(f"{BASE_URL}/efetch.fcgi", params={
+        "db": "pubmed",
+        "id": ids_str,
+        "retmode": "xml"
+    })
+    root = etree.fromstring(response.content)
+    papers = []
+    for article in root.xpath("//PubmedArticle"):
+        pmid = article.xpath(".//PMID/text()")[0]
+        title = "".join(article.xpath(".//ArticleTitle/text()"))
+        date = article.xpath(".//PubDate/Year/text()")
+        authors_info = article.xpath(".//Author")
+        authors = []
+        for author in authors_info:
+            first = author.xpath("./ForeName/text()")
+            last = author.xpath("./LastName/text()")
+            name = " ".join(first + last)
+            affiliation = " ".join(author.xpath(".//Affiliation/text()"))
+            email = next((s for s in affiliation.split() if "@" in s), "")
+            authors.append({"name": name, "affiliation": affiliation, "email": email})
+        papers.append({
+            "pmid": pmid,
+            "title": title,
+            "date": date[0] if date else "N/A",
+            "authors": authors
+        })
+    return papers
+
+# ---------- Filters ----------
+
+NON_ACADEMIC_KEYWORDS = ["pharma", "therapeutics", "biosciences", "biotech", "labs", "inc.", "llc"]
+ACADEMIC_KEYWORDS = ["university", "college", "institute", "school", "department of"]
+
+def is_non_academic(affiliation: str) -> bool:
+    affil = affiliation.lower()
+    return (
+        any(kw in affil for kw in NON_ACADEMIC_KEYWORDS) and
+        not any(kw in affil for kw in ACADEMIC_KEYWORDS)
+    )
+
+def extract_non_academic_authors(authors: List[Dict]) -> (List[str], List[str], str):
+    non_acads: List[str] = []
+    companies: set = set()
+    corresponding_email: str = ""
+    for a in authors:
+        if is_non_academic(a["affiliation"]):
+            non_acads.append(a["name"])
+            companies.add(a["affiliation"])
+            if not corresponding_email and "@" in a["email"]:
+                corresponding_email = a["email"]
+    return non_acads, list(companies), corresponding_email
+
+# ---------- Output Writer ----------
+
+def write_csv(data: List[Dict], filename: Optional[str] = None) -> None:
+    headers = ["PubmedID", "Title", "Publication Date", "Non-academic Author(s)", "Company Affiliation(s)", "Corresponding Author Email"]
+    output = open(filename, "w", newline="") if filename else sys.stdout
+    writer = csv.DictWriter(output, fieldnames=headers)
+    writer.writeheader()
+    for item in data:
+        writer.writerow(item)
+    if filename:
+        output.close()
+
+# ---------- CLI Command ----------
+
+@app.command()
+def main(
+    query: str,
+    file: Optional[str] = typer.Option(None, "--file", "-f", help="Filename to save results."),
+    debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug output.")
+) -> None:
+    """Fetch PubMed papers and filter for non-academic authors."""
+    if debug:
+        print(f"Query: {query}")
+    try:
+        ids = search_pubmed(query)
+        if debug:
+            print(f"Found {len(ids)} PubMed IDs")
+        papers = fetch_details(ids)
+        results = []
+        for paper in papers:
+            non_acads, companies, email = extract_non_academic_authors(paper["authors"])
+            if non_acads:
+                results.append({
+                    "PubmedID": paper["pmid"],
+                    "Title": paper["title"],
+                    "Publication Date": paper["date"],
+                    "Non-academic Author(s)": "; ".join(non_acads),
+                    "Company Affiliation(s)": "; ".join(companies),
+                    "Corresponding Author Email": email,
+                })
+        write_csv(results, file)
+        if debug:
+            print(f"Exported {len(results)} papers.")
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+
+if __name__ == "__main__":
+    app()
